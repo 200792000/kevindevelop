@@ -2,8 +2,8 @@ services:
   - type: web
     name: inventory-api
     env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app
+    buildCommand: apt-get install -y libreoffice && pip install -r requirements.txt
+    startCommand: gunicorn app:app --timeout 120
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0
