@@ -10,11 +10,32 @@ import requests
 app = Flask(__name__)
 CORS(app)
 
-TEMPLATE_PATH     = os.path.join(os.path.dirname(__file__), 'template.xlsx')
-TEMPLATE_BU1_PATH = os.path.join(os.path.dirname(__file__), 'template_bu1.pdf')
+TEMPLATE_PATH      = os.path.join(os.path.dirname(__file__), 'template.xlsx')
+TEMPLATE_BU1_PATH  = os.path.join(os.path.dirname(__file__), 'template_bu1.pdf')
+TEMPLATE_NAME_FILE = os.path.join(os.path.dirname(__file__), 'template_name.txt')
 WEEKDAY_MAP = ['一','二','三','四','五','六','日']
 MAX_PER_SHEET = 10
 RENDER_SERVICE_ID = 'srv-d7mecdb7uimc73crjh6g'
+
+def get_template_name():
+    if os.path.exists(TEMPLATE_NAME_FILE):
+        with open(TEMPLATE_NAME_FILE, 'r', encoding='utf-8') as f:
+            return f.read().strip()
+    return 'template.xlsx'
+
+def save_template_name(name):
+    with open(TEMPLATE_NAME_FILE, 'w', encoding='utf-8') as f:
+        f.write(name)
+
+def get_notice_base_name():
+    """從範本檔名取得異動通知書基底名稱（去掉副檔名）"""
+    name = get_template_name()
+    base = os.path.splitext(name)[0]  # 去掉 .xlsx
+    return base
+
+def get_today_mmdd():
+    today = datetime.today()
+    return f"{today.month:02d}{today.day:02d}"
 
 # ── 計算已發送截止日 ──────────────────────────────────────────
 def get_sent_deadline(today=None):
@@ -65,6 +86,13 @@ def extract_version(filename):
     m = re.search(r'(\d{8})', filename)
     return m.group(1) if m else ''
 
+def extract_date_from_filename(filename):
+    m = re.search(r'(\d{8})', filename)
+    if m:
+        d = m.group(1)
+        return f"{int(d[0:4])}/{int(d[4:6])}/{int(d[6:8])}"
+    return ''
+
 # ── 比對並分類 ────────────────────────────────────────────────
 def compare_and_classify(m1, m2, deadline):
     異動通知 = []
@@ -78,6 +106,7 @@ def compare_and_classify(m1, m2, deadline):
             orig = sorted(a['dates'])[0]
             chg  = sorted(b['dates'])[0]
             orig_dt = parse_date(orig)
+            chg_dt  = parse_date(chg)
             diff = {
                 '店號':   k,
                 '店名':   a['店名'],
@@ -88,12 +117,12 @@ def compare_and_classify(m1, m2, deadline):
             }
             if orig_dt <= deadline:
                 異動通知.append(diff)
-            else:
+            elif chg_dt <= deadline:
                 補1通知.append(diff)
     return 異動通知, 補1通知
 
 # ── 產出單份異動通知書 Excel ──────────────────────────────────
-def generate_single_notice(diffs, version_full):
+def generate_single_notice(diffs, version_full, notifier=''):
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx')
     tmp.close()
     shutil.copy(TEMPLATE_PATH, tmp.name)
@@ -114,7 +143,7 @@ def generate_single_notice(diffs, version_full):
         c.value = parse_date(d['原訂日']); c.number_format = DATE_FMT
         ws.cell(row=r_d1, column=5).value = d['原訂午']
         ws.cell(row=r_d1, column=6).value = REASON
-        ws.cell(row=r_d1, column=8).value = None
+        ws.cell(row=r_d1, column=8).value = notifier if notifier else None
         ws.cell(row=r_d1, column=9).value = None
         c2 = ws.cell(row=r_d2, column=4)
         c2.value = parse_date(d['異動日']); c2.number_format = DATE_FMT
@@ -134,16 +163,18 @@ def generate_single_notice(diffs, version_full):
     return tmp.name
 
 # ── 產出異動通知書（超過10店自動分份）────────────────────────
-def generate_notice_files(diffs, version_full):
+def generate_notice_files(diffs, version_full, notifier=''):
     chunks = [diffs[i:i+MAX_PER_SHEET] for i in range(0, len(diffs), MAX_PER_SHEET)]
     files = []
-    today = datetime.today().strftime('%Y%m%d')
+    base_name = get_notice_base_name()  # e.g. (11504)盤點行程異動通知書-
+    mmdd = get_today_mmdd()             # e.g. 0426
+
     for idx, chunk in enumerate(chunks):
-        path = generate_single_notice(chunk, version_full)
+        path = generate_single_notice(chunk, version_full, notifier)
         if len(chunks) == 1:
-            fname = f'盤點行程異動聯絡單_{version_full}_{today}.xlsx'
+            fname = f'{base_name}{mmdd}.xlsx'
         else:
-            fname = f'盤點行程異動聯絡單_{version_full}_{today}_第{idx+1}份.xlsx'
+            fname = f'{base_name}{mmdd}-{idx+1}.xlsx'
         files.append((fname, path))
     return files
 
@@ -189,27 +220,49 @@ def make_bu1_pdf(store_name, chg_date, chg_noon, out_path):
 
     doc.save(out_path)
 
-# ── API：健康檢查 ─────────────────────────────────────────────
+# ── API ───────────────────────────────────────────────────────
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'ok'})
+    return jsonify({'status': 'ok', 'template_name': get_template_name()})
 
-# ── API：比對班表 ─────────────────────────────────────────────
 @app.route('/compare', methods=['POST'])
 def api_compare():
     if 'file1' not in request.files or 'file2' not in request.files:
         return jsonify({'error': '請上傳兩個班表檔案'}), 400
     f1 = request.files['file1']
     f2 = request.files['file2']
+    force = request.form.get('force', 'false') == 'true'
     try:
-        m1, first_date = load_schedule(f1)
-        m2, _          = load_schedule(f2)
+        m1, first_date1 = load_schedule(f1)
+        m2, first_date2 = load_schedule(f2)
+
+        if first_date1 and first_date2:
+            dt1 = parse_date(first_date1)
+            dt2 = parse_date(first_date2)
+
+            # 版本二日期早於版本一 → 警告
+            if dt2 < dt1:
+                return jsonify({
+                    'error': '⚠️ 上傳位置可能錯誤！版本二（異動後班表）的日期早於版本一（原始班表），請確認是否上傳正確。',
+                    'warn_swap': True
+                }), 400
+
+            # 兩版本差距超過7天 → 需確認（除非 force=true）
+            diff_days = abs((dt2 - dt1).days)
+            if diff_days > 7 and not force:
+                return jsonify({
+                    'warn_gap': True,
+                    'gap_days': diff_days,
+                    'message': f'⚠️ 兩個版本的班表日期相差 {diff_days} 天，是否確認繼續？'
+                }), 200
+
         ver8   = extract_version(f1.filename)
-        month  = str(int(first_date.split('/')[1])).zfill(2)
+        month  = str(int(first_date1.split('/')[1])).zfill(2)
         version_full = month + '-' + ver8
         deadline = get_sent_deadline()
         異動通知, 補1通知 = compare_and_classify(m1, m2, deadline)
         notice_files = (len(異動通知) + MAX_PER_SHEET - 1) // MAX_PER_SHEET if 異動通知 else 0
+
         return jsonify({
             'version':       version_full,
             'month':         month,
@@ -221,30 +274,32 @@ def api_compare():
             'notice_diffs':  異動通知,
             'bu1_diffs':     補1通知,
             'notice_files':  notice_files,
+            'f1_date':       extract_date_from_filename(f1.filename),
+            'f2_date':       extract_date_from_filename(f2.filename),
+            'template_name': get_template_name(),
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# ── API：產出異動通知書 ───────────────────────────────────────
 @app.route('/generate_notice', methods=['POST'])
 def api_generate_notice():
     if 'file1' not in request.files or 'file2' not in request.files:
         return jsonify({'error': '請上傳兩個班表檔案'}), 400
     f1 = request.files['file1']
     f2 = request.files['file2']
+    notifier = request.form.get('notifier', '')
     try:
-        m1, first_date = load_schedule(f1)
-        m2, _          = load_schedule(f2)
+        m1, first_date1 = load_schedule(f1)
+        m2, _           = load_schedule(f2)
         ver8   = extract_version(f1.filename)
-        month  = str(int(first_date.split('/')[1])).zfill(2)
+        month  = str(int(first_date1.split('/')[1])).zfill(2)
         version_full = month + '-' + ver8
         deadline = get_sent_deadline()
         異動通知, _ = compare_and_classify(m1, m2, deadline)
         if not 異動通知:
             return jsonify({'error': '無異動通知書資料'}), 400
 
-        files = generate_notice_files(異動通知, version_full)
-        today = datetime.today().strftime('%Y%m%d')
+        files = generate_notice_files(異動通知, version_full, notifier)
 
         if len(files) == 1:
             return send_file(files[0][1], as_attachment=True,
@@ -256,13 +311,14 @@ def api_generate_notice():
             with zipfile.ZipFile(zip_tmp.name, 'w') as zf:
                 for fname, fpath in files:
                     zf.write(fpath, fname)
+            base_name = get_notice_base_name()
+            mmdd = get_today_mmdd()
             return send_file(zip_tmp.name, as_attachment=True,
-                download_name=f'盤點行程異動聯絡單_{version_full}_{today}.zip',
+                download_name=f'{base_name}{mmdd}.zip',
                 mimetype='application/zip')
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# ── API：產出補1通知書 ────────────────────────────────────────
 @app.route('/generate_bu1', methods=['POST'])
 def api_generate_bu1():
     if 'file1' not in request.files or 'file2' not in request.files:
@@ -270,10 +326,10 @@ def api_generate_bu1():
     f1 = request.files['file1']
     f2 = request.files['file2']
     try:
-        m1, first_date = load_schedule(f1)
-        m2, _          = load_schedule(f2)
+        m1, first_date1 = load_schedule(f1)
+        m2, _           = load_schedule(f2)
         ver8   = extract_version(f1.filename)
-        month  = str(int(first_date.split('/')[1])).zfill(2)
+        month  = str(int(first_date1.split('/')[1])).zfill(2)
         version_full = month + '-' + ver8
         deadline = get_sent_deadline()
         _, 補1通知 = compare_and_classify(m1, m2, deadline)
@@ -285,12 +341,14 @@ def api_generate_bu1():
         for d in 補1通知:
             chg_dt = parse_date(d['異動日'])
             mmdd = f"{chg_dt.month:02d}{chg_dt.day:02d}"
-            fname = f"(補1)實地盤點實施通知書-{d['店名']}{mmdd}.pdf"
+            # 去掉店名最後的「店」字
+            store_display = d['店名'][:-1] if d['店名'].endswith('店') else d['店名']
+            fname = f"(補1)實地盤點實施通知書-{store_display}{mmdd}.pdf"
             fpath = os.path.join(tmpdir, fname)
             make_bu1_pdf(d['店名'], chg_dt, d['異動午'], fpath)
             pdf_files.append((fname, fpath))
 
-        today = datetime.today().strftime('%Y%m%d')
+        mmdd_today = get_today_mmdd()
         zip_tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.zip')
         zip_tmp.close()
         with zipfile.ZipFile(zip_tmp.name, 'w') as zf:
@@ -298,22 +356,20 @@ def api_generate_bu1():
                 zf.write(fpath, fname)
 
         return send_file(zip_tmp.name, as_attachment=True,
-            download_name=f'補1通知書_{version_full}_{today}.zip',
+            download_name=f'補1通知書_{version_full}_{mmdd_today}.zip',
             mimetype='application/zip')
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# ── 管理員：驗證密碼 ──────────────────────────────────────────
 @app.route('/admin/verify', methods=['POST'])
 def admin_verify():
     data = request.get_json()
     password = data.get('password', '')
     admin_pw = os.environ.get('ADMIN_PASSWORD', '')
     if password == admin_pw:
-        return jsonify({'ok': True})
+        return jsonify({'ok': True, 'template_name': get_template_name()})
     return jsonify({'ok': False, 'error': '密碼錯誤'}), 401
 
-# ── 管理員：更換密碼 ──────────────────────────────────────────
 @app.route('/admin/change_password', methods=['POST'])
 def admin_change_password():
     data = request.get_json()
@@ -327,10 +383,7 @@ def admin_change_password():
     if not new_pw or len(new_pw) < 6:
         return jsonify({'error': '新密碼至少需要 6 個字元'}), 400
 
-    headers = {
-        'Authorization': f'Bearer {render_api_key}',
-        'Content-Type': 'application/json',
-    }
+    headers = {'Authorization': f'Bearer {render_api_key}', 'Content-Type': 'application/json'}
     url = f'https://api.render.com/v1/services/{RENDER_SERVICE_ID}/env-vars'
     payload = [
         {'key': 'ADMIN_PASSWORD', 'value': new_pw},
@@ -342,7 +395,6 @@ def admin_change_password():
     else:
         return jsonify({'error': f'更新失敗：{resp.text}'}), 500
 
-# ── 管理員：上傳新範本 ────────────────────────────────────────
 @app.route('/admin/upload_template', methods=['POST'])
 def admin_upload_template():
     password = request.form.get('password', '')
@@ -355,7 +407,8 @@ def admin_upload_template():
     if not f.filename.endswith('.xlsx'):
         return jsonify({'error': '請上傳 .xlsx 格式'}), 400
     f.save(TEMPLATE_PATH)
-    return jsonify({'ok': True, 'message': f'範本已更新！({f.filename})'})
+    save_template_name(f.filename)
+    return jsonify({'ok': True, 'message': f'範本已更新！({f.filename})', 'template_name': f.filename})
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
