@@ -65,6 +65,7 @@ def load_schedule(file_obj):
     idx_noon = headers.index('午別')
     map_ = {}
     first_date = None
+    last_date = None
     for row in rows[hi+1:]:
         shop = str(row[idx_shop] or '').strip()
         if not shop: continue
@@ -73,10 +74,11 @@ def load_schedule(file_obj):
         noon_full = '上午' if n == '上' else ('下午' if n == '下' else n)
         if d:
             if first_date is None: first_date = d
+            last_date = d
             map_.setdefault(shop, {'店名': str(row[idx_name] or '').strip(), 'dates': set(), 'noon': {}})
             map_[shop]['dates'].add(d)
             map_[shop]['noon'][d] = noon_full
-    return map_, first_date
+    return map_, first_date, last_date
 
 def parse_date(s):
     parts = s.split('/')
@@ -233,22 +235,26 @@ def api_compare():
     f2 = request.files['file2']
     force = request.form.get('force', 'false') == 'true'
     try:
-        m1, first_date1 = load_schedule(f1)
-        m2, first_date2 = load_schedule(f2)
+        m1, first_date1, last_date1 = load_schedule(f1)
+        m2, first_date2, last_date2 = load_schedule(f2)
 
-        if first_date1 and first_date2:
-            dt1 = parse_date(first_date1)
-            dt2 = parse_date(first_date2)
+        # 從檔名抓8碼日期比對新舊
+        fn1 = extract_version(f1.filename)  # e.g. 20260419
+        fn2 = extract_version(f2.filename)  # e.g. 20260426
+        if fn1 and fn2:
+            from datetime import datetime as dt_
+            d1 = dt_.strptime(fn1, '%Y%m%d')
+            d2 = dt_.strptime(fn2, '%Y%m%d')
 
-            # 版本二日期早於版本一 → 警告
-            if dt2 < dt1:
+            # 版本二檔名日期早於版本一 → 警告
+            if d2 < d1:
                 return jsonify({
-                    'error': '⚠️ 上傳位置可能錯誤！版本二（異動後班表）的日期早於版本一（原始班表），請確認是否上傳正確。',
+                    'error': '⚠️ 上傳位置可能錯誤！版本二（異動後班表）的檔案日期早於版本一（原始班表），請確認是否上傳正確。',
                     'warn_swap': True
                 }), 400
 
             # 兩版本差距超過7天 → 需確認（除非 force=true）
-            diff_days = abs((dt2 - dt1).days)
+            diff_days = abs((d2 - d1).days)
             if diff_days > 7 and not force:
                 return jsonify({
                     'warn_gap': True,
@@ -289,8 +295,8 @@ def api_generate_notice():
     f2 = request.files['file2']
     notifier = request.form.get('notifier', '')
     try:
-        m1, first_date1 = load_schedule(f1)
-        m2, _           = load_schedule(f2)
+        m1, first_date1, _ = load_schedule(f1)
+        m2, _, _           = load_schedule(f2)
         ver8   = extract_version(f1.filename)
         month  = str(int(first_date1.split('/')[1])).zfill(2)
         version_full = month + '-' + ver8
@@ -326,8 +332,8 @@ def api_generate_bu1():
     f1 = request.files['file1']
     f2 = request.files['file2']
     try:
-        m1, first_date1 = load_schedule(f1)
-        m2, _           = load_schedule(f2)
+        m1, first_date1, _ = load_schedule(f1)
+        m2, _, _           = load_schedule(f2)
         ver8   = extract_version(f1.filename)
         month  = str(int(first_date1.split('/')[1])).zfill(2)
         version_full = month + '-' + ver8
