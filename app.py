@@ -6,6 +6,8 @@ from datetime import datetime, timedelta
 import shutil, re, os, tempfile, zipfile
 import pymupdf
 import requests
+import gspread
+from google.oauth2.service_account import Credentials
 
 app = Flask(__name__)
 CORS(app)
@@ -16,6 +18,51 @@ TEMPLATE_NAME_FILE = os.path.join(os.path.dirname(__file__), 'template_name.txt'
 WEEKDAY_MAP = ['一','二','三','四','五','六','日']
 MAX_PER_SHEET = 10
 RENDER_SERVICE_ID = 'srv-d7mecdb7uimc73crjh6g'
+SCOPES = ['https://spreadsheets.google.com/feeds','https://www.googleapis.com/auth/drive']
+
+def get_sheet():
+    try:
+        creds_json = os.environ.get('GOOGLE_SERVICE_ACCOUNT','')
+        sheet_id   = os.environ.get('GOOGLE_SHEET_ID','')
+        if not creds_json or not sheet_id:
+            return None
+        import json
+        creds_dict = json.loads(creds_json)
+        creds  = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+        client = gspread.authorize(creds)
+        sheet  = client.open_by_key(sheet_id)
+        ws = sheet.sheet1
+        # 確保標題列存在
+        if not ws.row_values(1):
+            ws.append_row(['操作時間','操作者','課別','版本一檔名','版本二檔名',
+                          '依據版本','總異動店數','異動通知書','補1通知書',
+                          '店號','店名','原訂日期','原訂午別','異動後日期','異動後午別','文件類型'])
+        return ws
+    except Exception as e:
+        print(f'Google Sheets 連線失敗: {e}')
+        return None
+
+def log_to_sheet(ws, operator, dept, f1name, f2name, version_full, 異動通知, 補1通知):
+    try:
+        if not ws:
+            return
+        now = datetime.now().strftime('%Y/%m/%d %H:%M')
+        total = len(異動通知) + len(補1通知)
+        rows = []
+        for d in 異動通知:
+            rows.append([now, operator, dept, f1name, f2name, version_full,
+                        total, len(異動通知), len(補1通知),
+                        d['店號'], d['店名'], d['原訂日'], d['原訂午'],
+                        d['異動日'], d['異動午'], '異動通知書'])
+        for d in 補1通知:
+            rows.append([now, operator, dept, f1name, f2name, version_full,
+                        total, len(異動通知), len(補1通知),
+                        d['店號'], d['店名'], d['原訂日'], d['原訂午'],
+                        d['異動日'], d['異動午'], '補1通知書'])
+        if rows:
+            ws.append_rows(rows)
+    except Exception as e:
+        print(f'寫入 Google Sheets 失敗: {e}')
 
 def get_template_name():
     if os.path.exists(TEMPLATE_NAME_FILE):
@@ -227,6 +274,72 @@ def make_bu1_pdf(store_name, chg_date, chg_noon, out_path):
 def health():
     return jsonify({'status': 'ok', 'template_name': get_template_name()})
 
+@app.route('/admin/records', methods=['POST'])
+def admin_records():
+    data = request.get_json()
+    password  = data.get('password', '')
+    admin_pw  = os.environ.get('ADMIN_PASSWORD', '')
+    if password != admin_pw:
+        return jsonify({'error': '密碼錯誤'}), 401
+    # 篩選條件
+    date_from = data.get('date_from', '')   # e.g. 2026/04/29
+    date_to   = data.get('date_to', '')     # e.g. 2026/05/02
+    dept      = data.get('dept', '')
+    operator  = data.get('operator', '')
+    doc_type  = data.get('doc_type', '')    # 異動通知書 / 補1通知書
+    limit     = int(data.get('limit', 100))
+    try:
+        ws = get_sheet()
+        if not ws:
+            return jsonify({'error': 'Google Sheets 連線失敗'}), 500
+        all_rows = ws.get_all_values()
+        if not all_rows:
+            return jsonify({'records': [], 'headers': []})
+        headers = all_rows[0]
+        records = all_rows[1:]
+
+        # 篩選
+        def match(r):
+            if len(r) < 16: return False
+            # 日期範圍（欄位0：操作時間 格式 2026/04/29 14:30）
+            if date_from and r[0][:10] < date_from: return False
+            if date_to   and r[0][:10] > date_to:   return False
+            if dept      and dept not in r[2]:       return False
+            if operator  and operator not in r[1]:   return False
+            if doc_type  and doc_type != r[15]:      return False
+            return True
+
+        filtered = [r for r in records if match(r)]
+        filtered = list(reversed(filtered))[:limit]
+        return jsonify({'headers': headers, 'records': filtered, 'total': len(filtered)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/admin/search', methods=['POST'])
+def admin_search():
+    data = request.get_json()
+    password = data.get('password', '')
+    keyword  = data.get('keyword', '').strip()
+    admin_pw = os.environ.get('ADMIN_PASSWORD', '')
+    if password != admin_pw:
+        return jsonify({'error': '密碼錯誤'}), 401
+    if not keyword:
+        return jsonify({'error': '請輸入查詢關鍵字'}), 400
+    try:
+        ws = get_sheet()
+        if not ws:
+            return jsonify({'error': 'Google Sheets 連線失敗'}), 500
+        all_rows = ws.get_all_values()
+        if not all_rows:
+            return jsonify({'records': [], 'headers': []})
+        headers = all_rows[0]
+        # 搜尋店號或店名（第10、11欄，index 9、10）
+        results = [r for r in all_rows[1:] if len(r) > 10 and (keyword in r[9] or keyword in r[10])]
+        results = list(reversed(results))
+        return jsonify({'headers': headers, 'records': results})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/compare', methods=['POST'])
 def api_compare():
     if 'file1' not in request.files or 'file2' not in request.files:
@@ -262,12 +375,22 @@ def api_compare():
                     'message': f'⚠️ 兩個版本的班表日期相差 {diff_days} 天，是否確認繼續？'
                 }), 200
 
-        ver8   = extract_version(f1.filename)
+        ver8   = extract_version(f2.filename)  # 依據版本二
         month  = str(int(first_date1.split('/')[1])).zfill(2)
         version_full = month + '-' + ver8
         deadline = get_sent_deadline()
         異動通知, 補1通知 = compare_and_classify(m1, m2, deadline)
         notice_files = (len(異動通知) + MAX_PER_SHEET - 1) // MAX_PER_SHEET if 異動通知 else 0
+
+        operator = request.form.get('operator', '')
+        dept     = request.form.get('dept', '')
+
+        # 寫入 Google Sheets
+        try:
+            ws = get_sheet()
+            log_to_sheet(ws, operator, dept, f1.filename, f2.filename, version_full, 異動通知, 補1通知)
+        except Exception as e:
+            print(f'Sheets log error: {e}')
 
         return jsonify({
             'version':       version_full,
