@@ -64,20 +64,60 @@ def log_to_sheet(ws, operator, dept, f1name, f2name, version_full, 異動通知,
     except Exception as e:
         print(f'寫入 Google Sheets 失敗: {e}')
 
+# ── Google Sheets 設定管理 ───────────────────────────────────
+def get_settings_sheet():
+    try:
+        creds_json = os.environ.get('GOOGLE_SERVICE_ACCOUNT','')
+        sheet_id   = os.environ.get('GOOGLE_SHEET_ID','')
+        if not creds_json or not sheet_id:
+            return None
+        import json
+        creds_dict = json.loads(creds_json)
+        creds  = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+        client = gspread.authorize(creds)
+        sheet  = client.open_by_key(sheet_id)
+        return sheet.worksheet('系統設定')
+    except Exception as e:
+        print(f'系統設定 Sheets 連線失敗: {e}')
+        return None
+
+def get_setting(key, default=''):
+    try:
+        ws = get_settings_sheet()
+        if not ws: return default
+        rows = ws.get_all_values()
+        for row in rows[1:]:  # 跳過標題列
+            if row and row[0] == key:
+                return row[1] if len(row) > 1 else default
+        return default
+    except:
+        return default
+
+def set_setting(key, value):
+    try:
+        ws = get_settings_sheet()
+        if not ws: return False
+        rows = ws.get_all_values()
+        for i, row in enumerate(rows):
+            if row and row[0] == key:
+                ws.update_cell(i+1, 2, value)
+                return True
+        # 不存在就新增
+        ws.append_row([key, value])
+        return True
+    except Exception as e:
+        print(f'set_setting 失敗: {e}')
+        return False
+
 def get_template_name():
-    if os.path.exists(TEMPLATE_NAME_FILE):
-        with open(TEMPLATE_NAME_FILE, 'r', encoding='utf-8') as f:
-            return f.read().strip()
-    return 'template.xlsx'
+    return get_setting('TEMPLATE_NAME', 'template.xlsx')
 
 def save_template_name(name):
-    with open(TEMPLATE_NAME_FILE, 'w', encoding='utf-8') as f:
-        f.write(name)
+    set_setting('TEMPLATE_NAME', name)
 
 def get_notice_base_name():
-    """從範本檔名取得異動通知書基底名稱（去掉副檔名）"""
     name = get_template_name()
-    base = os.path.splitext(name)[0]  # 去掉 .xlsx
+    base = os.path.splitext(name)[0]
     return base
 
 def get_today_mmdd():
@@ -168,6 +208,9 @@ def compare_and_classify(m1, m2, deadline):
                 異動通知.append(diff)
             elif chg_dt <= deadline:
                 補1通知.append(diff)
+    # 依原訂日期排序
+    異動通知.sort(key=lambda x: x['原訂日'])
+    補1通知.sort(key=lambda x: x['原訂日'])
     return 異動通知, 補1通知
 
 # ── 產出單份異動通知書 Excel ──────────────────────────────────
@@ -272,7 +315,11 @@ def make_bu1_pdf(store_name, chg_date, chg_noon, out_path):
 # ── API ───────────────────────────────────────────────────────
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'ok', 'template_name': get_template_name()})
+    return jsonify({
+        'status': 'ok',
+        'template_name':    get_template_name(),
+        'shop_update_date': get_setting('SHOP_UPDATE_DATE', ''),
+    })
 
 @app.route('/admin/records', methods=['POST'])
 def admin_records():
@@ -380,6 +427,9 @@ def api_compare():
         version_full = month + '-' + ver8
         deadline = get_sent_deadline()
         異動通知, 補1通知 = compare_and_classify(m1, m2, deadline)
+        # 依原訂日期排序
+        異動通知.sort(key=lambda x: x['原訂日'])
+        補1通知.sort(key=lambda x: x['原訂日'])
         notice_files = (len(異動通知) + MAX_PER_SHEET - 1) // MAX_PER_SHEET if 異動通知 else 0
 
         operator = request.form.get('operator', '')
@@ -405,7 +455,8 @@ def api_compare():
             'notice_files':  notice_files,
             'f1_date':       extract_date_from_filename(f1.filename),
             'f2_date':       extract_date_from_filename(f2.filename),
-            'template_name': get_template_name(),
+            'template_name':    get_template_name(),
+            'shop_update_date': get_setting('SHOP_UPDATE_DATE', ''),
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -494,9 +545,15 @@ def api_generate_bu1():
 def admin_verify():
     data = request.get_json()
     password = data.get('password', '')
-    admin_pw = os.environ.get('ADMIN_PASSWORD', '')
+    # 優先從 Sheets 讀取，fallback 到環境變數
+    admin_pw = get_setting('ADMIN_PASSWORD', os.environ.get('ADMIN_PASSWORD', ''))
     if password == admin_pw:
-        return jsonify({'ok': True, 'template_name': get_template_name()})
+        return jsonify({
+            'ok': True,
+            'template_name':    get_setting('TEMPLATE_NAME', 'template.xlsx'),
+            'shop_update_date': get_setting('SHOP_UPDATE_DATE', ''),
+            'staff_update_date':get_setting('STAFF_UPDATE_DATE', ''),
+        })
     return jsonify({'ok': False, 'error': '密碼錯誤'}), 401
 
 @app.route('/admin/change_password', methods=['POST'])
@@ -512,17 +569,11 @@ def admin_change_password():
     if not new_pw or len(new_pw) < 6:
         return jsonify({'error': '新密碼至少需要 6 個字元'}), 400
 
-    headers = {'Authorization': f'Bearer {render_api_key}', 'Content-Type': 'application/json'}
-    url = f'https://api.render.com/v1/services/{RENDER_SERVICE_ID}/env-vars'
-    payload = [
-        {'key': 'ADMIN_PASSWORD', 'value': new_pw},
-        {'key': 'RENDER_API_KEY', 'value': render_api_key},
-    ]
-    resp = requests.put(url, json=payload, headers=headers)
-    if resp.status_code in [200, 201]:
-        return jsonify({'ok': True, 'message': '密碼已更新！'})
+    ok = set_setting('ADMIN_PASSWORD', new_pw)
+    if ok:
+        return jsonify({'ok': True, 'message': '密碼已更新！立即生效。'})
     else:
-        return jsonify({'error': f'更新失敗：{resp.text}'}), 500
+        return jsonify({'error': '更新失敗，請稍後再試'}), 500
 
 @app.route('/admin/upload_template', methods=['POST'])
 def admin_upload_template():
@@ -537,7 +588,13 @@ def admin_upload_template():
         return jsonify({'error': '請上傳 .xlsx 格式'}), 400
     f.save(TEMPLATE_PATH)
     save_template_name(f.filename)
-    return jsonify({'ok': True, 'message': f'範本已更新！({f.filename})', 'template_name': f.filename})
+    return jsonify({
+        'ok': True,
+        'message': f'範本已更新！({f.filename})',
+        'template_name': f.filename,
+        'shop_update_date':  get_setting('SHOP_UPDATE_DATE', ''),
+        'staff_update_date': get_setting('STAFF_UPDATE_DATE', ''),
+    })
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
