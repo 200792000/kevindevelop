@@ -306,9 +306,20 @@ def make_bu1_pdf(store_name, chg_date, chg_noon, out_path):
             continue
 
         bbox = span['bbox']
-        rect = pymupdf.Rect(bbox[0]-1, bbox[1]-1, bbox[2]+8, bbox[3]+1)
+        # 蓋掉範圍加大一點確保完全覆蓋
+        rect = pymupdf.Rect(bbox[0]-2, bbox[1]-1, bbox[2]+10, bbox[3]+1)
         page.draw_rect(rect, color=(1,1,1), fill=(1,1,1))
-        page.insert_text((x, y), new_text, fontsize=size, color=(0,0,1), fontname='china-t')
+
+        # 計算文字寬度，靠右對齊到原始 bbox 右側
+        orig_right = bbox[2]
+        font = pymupdf.Font('china-t')
+        text_width = font.text_length(new_text, fontsize=size)
+        # 讓文字右邊對齊原始右邊，但不超過下一個欄位
+        new_x = orig_right - text_width
+        # 如果計算出來比原始 x 還小很多，就用原始 x（避免跑太遠）
+        if new_x < x - 5:
+            new_x = x
+        page.insert_text((new_x, y), new_text, fontsize=size, color=(0,0,1), fontname='china-t')
 
     doc.save(out_path)
 
