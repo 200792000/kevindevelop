@@ -14,7 +14,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email.mime.text import MIMEText
 from email import encoders
-from email.header import Header
+from email.header import Header as EmailHeader
 from email.utils import formataddr
 
 app = Flask(__name__)
@@ -376,7 +376,7 @@ def send_email_with_attachments(subject, body, attachments, sender_name='盤點�
         msg = MIMEMultipart()
         msg['From']    = formataddr((sender_name, smtp_user))
         msg['To']      = ', '.join(recipients)
-        msg['Subject'] = Header(subject, 'utf-8').encode()
+        msg['Subject'] = EmailHeader(subject, 'utf-8').encode()
         msg.attach(MIMEText(body, 'plain', 'utf-8'))
 
         # 附加檔案
