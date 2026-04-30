@@ -10,6 +10,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 import pytz  # ← 新增（解決時區問題）
 import smtplib  # ← 新增（發信）
+import threading  # ← 新增（非同步發信）
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email.mime.text import MIMEText
@@ -386,7 +387,6 @@ def send_email_with_attachments(subject, body, attachments, sender_name='盤點�
                 part.set_payload(f.read())
             encoders.encode_base64(part)
             # 中文檔名處理
-            from email.header import Header
             part.add_header(
                 'Content-Disposition',
                 f'attachment',
@@ -394,23 +394,20 @@ def send_email_with_attachments(subject, body, attachments, sender_name='盤點�
             )
             msg.attach(part)
 
-        # 依 port / TLS 選擇連線方式
+        # 依 port / TLS 選擇連線方式（timeout=15 避免 hang）
         if smtp_port == 465:
-            # SSL 直連（Gmail 465 / 部分公司信箱）
-            with smtplib.SMTP_SSL(smtp_host, smtp_port) as server:
+            with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=15) as server:
                 server.login(smtp_user, smtp_password)
                 server.sendmail(smtp_user, recipients, msg.as_string())
         elif use_tls:
-            # STARTTLS（587，最常見）
-            with smtplib.SMTP(smtp_host, smtp_port) as server:
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=15) as server:
                 server.ehlo()
                 server.starttls()
                 server.ehlo()
                 server.login(smtp_user, smtp_password)
                 server.sendmail(smtp_user, recipients, msg.as_string())
         else:
-            # 無加密（port 25，部分內部信箱）
-            with smtplib.SMTP(smtp_host, smtp_port) as server:
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=15) as server:
                 server.ehlo()
                 if smtp_password:
                     server.login(smtp_user, smtp_password)
@@ -637,7 +634,7 @@ def api_generate_bu1():
             for fname, fpath in pdf_files:
                 zf.write(fpath, fname)
 
-        # ✅ 新增：下載完成後自動寄信給經理/課長
+        # ✅ 發信改為背景執行，不影響下載
         try:
             operator  = request.form.get('operator', '操作者未知')
             dept      = request.form.get('dept', '')
@@ -651,9 +648,13 @@ def api_generate_bu1():
                 f'補1通知書共 {len(補1通知)} 份，請見附件。\n\n'
                 f'此信由系統自動寄出，請勿直接回覆。'
             )
-            send_email_with_attachments(subject, body, pdf_files, sender_name=sender_display)
+            # 複製 pdf_files 路徑避免 thread 競爭
+            email_files = list(pdf_files)
+            def send_async():
+                send_email_with_attachments(subject, body, email_files, sender_name=sender_display)
+            threading.Thread(target=send_async, daemon=True).start()
         except Exception as e:
-            print(f'寄信失敗（不影響下載）: {e}')
+            print(f'寄信執行緒啟動失敗（不影響下載）: {e}')
 
         return send_file(zip_tmp.name, as_attachment=True,
             download_name=f'補1通知書_{version_full}_{mmdd_today}.zip',
