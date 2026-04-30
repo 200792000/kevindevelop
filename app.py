@@ -8,6 +8,14 @@ import pymupdf
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
+import pytz  # ← 新增（解決時區問題）
+import smtplib  # ← 新增（發信）
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email.mime.text import MIMEText
+from email import encoders
+from email.header import Header
+from email.utils import formataddr
 
 app = Flask(__name__)
 CORS(app)
@@ -19,6 +27,14 @@ WEEKDAY_MAP = ['一','二','三','四','五','六','日']
 MAX_PER_SHEET = 10
 RENDER_SERVICE_ID = 'srv-d7mecdb7uimc73crjh6g'
 SCOPES = ['https://spreadsheets.google.com/feeds','https://www.googleapis.com/auth/drive']
+
+# ── 台灣時區（修正時區問題）────────────────────────────────────
+TW_TZ = pytz.timezone('Asia/Taipei')
+
+def tw_now():
+    """取得台灣當前時間（UTC+8）"""
+    return datetime.now(TW_TZ)
+
 
 def get_sheet():
     try:
@@ -32,7 +48,6 @@ def get_sheet():
         client = gspread.authorize(creds)
         sheet  = client.open_by_key(sheet_id)
         ws = sheet.sheet1
-        # 確保標題列存在
         if not ws.row_values(1):
             ws.append_row(['操作時間','操作者','課別','版本一檔名','版本二檔名',
                           '依據版本','總異動店數','異動通知書','補1通知書',
@@ -46,7 +61,8 @@ def log_to_sheet(ws, operator, dept, f1name, f2name, version_full, 異動通知,
     try:
         if not ws:
             return
-        now = datetime.now().strftime('%Y/%m/%d %H:%M')
+        # ✅ 修正：使用台灣時間
+        now = tw_now().strftime('%Y/%m/%d %H:%M')
         total = len(異動通知) + len(補1通知)
         rows = []
         for d in 異動通知:
@@ -86,7 +102,7 @@ def get_setting(key, default=''):
         ws = get_settings_sheet()
         if not ws: return default
         rows = ws.get_all_values()
-        for row in rows[1:]:  # 跳過標題列
+        for row in rows[1:]:
             if row and row[0] == key:
                 return row[1] if len(row) > 1 else default
         return default
@@ -102,12 +118,15 @@ def set_setting(key, value):
             if row and row[0] == key:
                 ws.update_cell(i+1, 2, value)
                 return True
-        # 不存在就新增
         ws.append_row([key, value])
         return True
     except Exception as e:
         print(f'set_setting 失敗: {e}')
         return False
+
+def get_admin_password():
+    """✅ 統一密碼讀取：Sheets 優先，fallback 環境變數"""
+    return get_setting('ADMIN_PASSWORD', os.environ.get('ADMIN_PASSWORD', ''))
 
 def get_template_name():
     return get_setting('TEMPLATE_NAME', 'template.xlsx')
@@ -121,13 +140,15 @@ def get_notice_base_name():
     return base
 
 def get_today_mmdd():
-    today = datetime.today()
+    # ✅ 修正：使用台灣時間
+    today = tw_now()
     return f"{today.month:02d}{today.day:02d}"
 
 # ── 計算已發送截止日 ──────────────────────────────────────────
 def get_sent_deadline(today=None):
     if today is None:
-        today = datetime.today()
+        # ✅ 修正：使用台灣時間（去掉 tzinfo 以便後續比較）
+        today = tw_now().replace(tzinfo=None)
     days_since_monday = today.weekday()
     this_monday = today - timedelta(days=days_since_monday)
     this_monday = this_monday.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -208,7 +229,6 @@ def compare_and_classify(m1, m2, deadline):
                 異動通知.append(diff)
             elif chg_dt <= deadline:
                 補1通知.append(diff)
-    # 依原訂日期排序
     異動通知.sort(key=lambda x: x['原訂日'])
     補1通知.sort(key=lambda x: x['原訂日'])
     return 異動通知, 補1通知
@@ -258,8 +278,8 @@ def generate_single_notice(diffs, version_full, notifier=''):
 def generate_notice_files(diffs, version_full, notifier=''):
     chunks = [diffs[i:i+MAX_PER_SHEET] for i in range(0, len(diffs), MAX_PER_SHEET)]
     files = []
-    base_name = get_notice_base_name()  # e.g. (11504)盤點行程異動通知書-
-    mmdd = get_today_mmdd()             # e.g. 0426
+    base_name = get_notice_base_name()
+    mmdd = get_today_mmdd()
 
     for idx, chunk in enumerate(chunks):
         path = generate_single_notice(chunk, version_full, notifier)
@@ -306,28 +326,109 @@ def make_bu1_pdf(store_name, chg_date, chg_noon, out_path):
             continue
 
         bbox = span['bbox']
-        # 蓋掉範圍加大一點確保完全覆蓋
         rect = pymupdf.Rect(bbox[0]-2, bbox[1]-1, bbox[2]+10, bbox[3]+1)
         page.draw_rect(rect, color=(1,1,1), fill=(1,1,1))
 
-        # 計算文字寬度，靠右對齊到原始 bbox 右側
         orig_right = bbox[2]
         font = pymupdf.Font('china-t')
         text_width = font.text_length(new_text, fontsize=size)
-        # 讓文字右邊對齊原始右邊，但不超過下一個欄位
         new_x = orig_right - text_width
-        # 如果計算出來比原始 x 還小很多，就用原始 x（避免跑太遠）
         if new_x < x - 5:
             new_x = x
         page.insert_text((new_x, y), new_text, fontsize=size, color=(0,0,1), fontname='china-t')
 
     doc.save(out_path)
 
+# ── 發信功能 ─────────────────────────────────────────────────
+def send_email_with_attachments(subject, body, attachments, sender_name='盤點系統'):
+    """
+    從 Google Sheets 系統設定讀取發信設定，寄送含附件的郵件。
+    支援任何 SMTP 伺服器（Gmail / 公司信箱皆可）。
+
+    系統設定需有以下 Key：
+      SMTP_HOST        - SMTP 伺服器，例如 mail.fme.com.tw
+      SMTP_PORT        - 連接埠，例如 587 或 465 或 25
+      SMTP_USER        - 寄件帳號，例如 kevin@fme.com.tw
+      SMTP_PASSWORD    - 信箱密碼
+      SMTP_USE_TLS     - 是否使用 STARTTLS：true / false（port 587 填 true，465 填 false）
+      MANAGER_EMAIL    - 經理信箱
+      SUPERVISOR_EMAIL - 課長信箱
+    """
+    try:
+        smtp_host     = get_setting('SMTP_HOST', 'mail.fme.com.tw')
+        smtp_port     = int(get_setting('SMTP_PORT', '587'))
+        smtp_user     = get_setting('SMTP_USER', '')
+        smtp_password = get_setting('SMTP_PASSWORD', '')
+        use_tls       = get_setting('SMTP_USE_TLS', 'true').strip().lower() == 'true'
+        manager_email    = get_setting('MANAGER_EMAIL', '')
+        supervisor_email = get_setting('SUPERVISOR_EMAIL', '')
+
+        if not smtp_user or not smtp_password:
+            print('發信設定不完整（SMTP_USER / SMTP_PASSWORD 未設定）')
+            return False
+
+        recipients = [r.strip() for r in [manager_email, supervisor_email] if r.strip()]
+        if not recipients:
+            print('收件人信箱未設定（MANAGER_EMAIL / SUPERVISOR_EMAIL）')
+            return False
+
+        # 組裝郵件（寄件者顯示操作者姓名，實際帳號為系統信箱）
+        msg = MIMEMultipart()
+        msg['From']    = formataddr((sender_name, smtp_user))
+        msg['To']      = ', '.join(recipients)
+        msg['Subject'] = Header(subject, 'utf-8').encode()
+        msg.attach(MIMEText(body, 'plain', 'utf-8'))
+
+        # 附加檔案
+        for fname, fpath in attachments:
+            with open(fpath, 'rb') as f:
+                part = MIMEBase('application', 'octet-stream')
+                part.set_payload(f.read())
+            encoders.encode_base64(part)
+            # 中文檔名處理
+            from email.header import Header
+            part.add_header(
+                'Content-Disposition',
+                f'attachment',
+                filename=('utf-8', '', fname)
+            )
+            msg.attach(part)
+
+        # 依 port / TLS 選擇連線方式
+        if smtp_port == 465:
+            # SSL 直連（Gmail 465 / 部分公司信箱）
+            with smtplib.SMTP_SSL(smtp_host, smtp_port) as server:
+                server.login(smtp_user, smtp_password)
+                server.sendmail(smtp_user, recipients, msg.as_string())
+        elif use_tls:
+            # STARTTLS（587，最常見）
+            with smtplib.SMTP(smtp_host, smtp_port) as server:
+                server.ehlo()
+                server.starttls()
+                server.ehlo()
+                server.login(smtp_user, smtp_password)
+                server.sendmail(smtp_user, recipients, msg.as_string())
+        else:
+            # 無加密（port 25，部分內部信箱）
+            with smtplib.SMTP(smtp_host, smtp_port) as server:
+                server.ehlo()
+                if smtp_password:
+                    server.login(smtp_user, smtp_password)
+                server.sendmail(smtp_user, recipients, msg.as_string())
+
+        print(f'信件已寄出至：{recipients}（{smtp_host}:{smtp_port}）')
+        return True
+
+    except Exception as e:
+        print(f'發信失敗: {e}')
+        return False
+
 # ── API ───────────────────────────────────────────────────────
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({
         'status': 'ok',
+        'server_time':      tw_now().strftime('%Y/%m/%d %H:%M'),  # ✅ 可用來確認時區
         'template_name':    get_template_name(),
         'shop_update_date': get_setting('SHOP_UPDATE_DATE', ''),
     })
@@ -336,15 +437,14 @@ def health():
 def admin_records():
     data = request.get_json()
     password  = data.get('password', '')
-    admin_pw  = os.environ.get('ADMIN_PASSWORD', '')
-    if password != admin_pw:
+    # ✅ 修正：統一從 get_admin_password() 讀取
+    if password != get_admin_password():
         return jsonify({'error': '密碼錯誤'}), 401
-    # 篩選條件
-    date_from = data.get('date_from', '')   # e.g. 2026/04/29
-    date_to   = data.get('date_to', '')     # e.g. 2026/05/02
+    date_from = data.get('date_from', '')
+    date_to   = data.get('date_to', '')
     dept      = data.get('dept', '')
     operator  = data.get('operator', '')
-    doc_type  = data.get('doc_type', '')    # 異動通知書 / 補1通知書
+    doc_type  = data.get('doc_type', '')
     limit     = int(data.get('limit', 100))
     try:
         ws = get_sheet()
@@ -356,10 +456,8 @@ def admin_records():
         headers = all_rows[0]
         records = all_rows[1:]
 
-        # 篩選
         def match(r):
             if len(r) < 16: return False
-            # 日期範圍（欄位0：操作時間 格式 2026/04/29 14:30）
             if date_from and r[0][:10] < date_from: return False
             if date_to   and r[0][:10] > date_to:   return False
             if dept      and dept not in r[2]:       return False
@@ -378,8 +476,8 @@ def admin_search():
     data = request.get_json()
     password = data.get('password', '')
     keyword  = data.get('keyword', '').strip()
-    admin_pw = os.environ.get('ADMIN_PASSWORD', '')
-    if password != admin_pw:
+    # ✅ 修正：統一從 get_admin_password() 讀取
+    if password != get_admin_password():
         return jsonify({'error': '密碼錯誤'}), 401
     if not keyword:
         return jsonify({'error': '請輸入查詢關鍵字'}), 400
@@ -391,7 +489,6 @@ def admin_search():
         if not all_rows:
             return jsonify({'records': [], 'headers': []})
         headers = all_rows[0]
-        # 搜尋店號或店名（第10、11欄，index 9、10）
         results = [r for r in all_rows[1:] if len(r) > 10 and (keyword in r[9] or keyword in r[10])]
         results = list(reversed(results))
         return jsonify({'headers': headers, 'records': results})
@@ -409,22 +506,19 @@ def api_compare():
         m1, first_date1, last_date1 = load_schedule(f1)
         m2, first_date2, last_date2 = load_schedule(f2)
 
-        # 從檔名抓8碼日期比對新舊
-        fn1 = extract_version(f1.filename)  # e.g. 20260419
-        fn2 = extract_version(f2.filename)  # e.g. 20260426
+        fn1 = extract_version(f1.filename)
+        fn2 = extract_version(f2.filename)
         if fn1 and fn2:
             from datetime import datetime as dt_
             d1 = dt_.strptime(fn1, '%Y%m%d')
             d2 = dt_.strptime(fn2, '%Y%m%d')
 
-            # 版本二檔名日期早於版本一 → 警告
             if d2 < d1:
                 return jsonify({
                     'error': '⚠️ 上傳位置可能錯誤！版本二（異動後班表）的檔案日期早於版本一（原始班表），請確認是否上傳正確。',
                     'warn_swap': True
                 }), 400
 
-            # 兩版本差距超過7天 → 需確認（除非 force=true）
             diff_days = abs((d2 - d1).days)
             if diff_days > 7 and not force:
                 return jsonify({
@@ -433,12 +527,11 @@ def api_compare():
                     'message': f'⚠️ 兩個版本的班表日期相差 {diff_days} 天，是否確認繼續？'
                 }), 200
 
-        ver8   = extract_version(f2.filename)  # 依據版本二
+        ver8   = extract_version(f2.filename)
         month  = str(int(first_date1.split('/')[1])).zfill(2)
         version_full = month + '-' + ver8
         deadline = get_sent_deadline()
         異動通知, 補1通知 = compare_and_classify(m1, m2, deadline)
-        # 依原訂日期排序
         異動通知.sort(key=lambda x: x['原訂日'])
         補1通知.sort(key=lambda x: x['原訂日'])
         notice_files = (len(異動通知) + MAX_PER_SHEET - 1) // MAX_PER_SHEET if 異動通知 else 0
@@ -446,7 +539,6 @@ def api_compare():
         operator = request.form.get('operator', '')
         dept     = request.form.get('dept', '')
 
-        # 寫入 Google Sheets
         try:
             ws = get_sheet()
             log_to_sheet(ws, operator, dept, f1.filename, f2.filename, version_full, 異動通知, 補1通知)
@@ -532,7 +624,6 @@ def api_generate_bu1():
         for d in 補1通知:
             chg_dt = parse_date(d['異動日'])
             mmdd = f"{chg_dt.month:02d}{chg_dt.day:02d}"
-            # 去掉店名最後的「店」字
             store_display = d['店名'][:-1] if d['店名'].endswith('店') else d['店名']
             fname = f"(補1)實地盤點實施通知書-{store_display}{mmdd}.pdf"
             fpath = os.path.join(tmpdir, fname)
@@ -546,6 +637,24 @@ def api_generate_bu1():
             for fname, fpath in pdf_files:
                 zf.write(fpath, fname)
 
+        # ✅ 新增：下載完成後自動寄信給經理/課長
+        try:
+            operator  = request.form.get('operator', '操作者未知')
+            dept      = request.form.get('dept', '')
+            now_str   = tw_now().strftime('%Y/%m/%d %H:%M')
+            sender_display = f'{operator}（{dept}）' if dept else operator
+            subject = f'【補1通知書】{version_full} 已產出'
+            body = (
+                f'您好，\n\n'
+                f'操作者：{sender_display}\n'
+                f'產出時間：{now_str}\n'
+                f'補1通知書共 {len(補1通知)} 份，請見附件。\n\n'
+                f'此信由系統自動寄出，請勿直接回覆。'
+            )
+            send_email_with_attachments(subject, body, pdf_files, sender_name=sender_display)
+        except Exception as e:
+            print(f'寄信失敗（不影響下載）: {e}')
+
         return send_file(zip_tmp.name, as_attachment=True,
             download_name=f'補1通知書_{version_full}_{mmdd_today}.zip',
             mimetype='application/zip')
@@ -556,7 +665,7 @@ def api_generate_bu1():
 def admin_verify():
     data = request.get_json()
     password = data.get('password', '')
-    # 優先從 Sheets 讀取，fallback 到環境變數
+    # ✅ Sheets 優先，fallback 環境變數
     admin_pw = get_setting('ADMIN_PASSWORD', os.environ.get('ADMIN_PASSWORD', ''))
     if password == admin_pw:
         return jsonify({
@@ -572,10 +681,8 @@ def admin_change_password():
     data = request.get_json()
     old_pw  = data.get('old_password', '')
     new_pw  = data.get('new_password', '')
-    admin_pw = os.environ.get('ADMIN_PASSWORD', '')
-    render_api_key = os.environ.get('RENDER_API_KEY', '')
-
-    if old_pw != admin_pw:
+    # ✅ 修正：舊密碼也從 Sheets 讀
+    if old_pw != get_admin_password():
         return jsonify({'error': '舊密碼錯誤'}), 401
     if not new_pw or len(new_pw) < 6:
         return jsonify({'error': '新密碼至少需要 6 個字元'}), 400
@@ -589,8 +696,8 @@ def admin_change_password():
 @app.route('/admin/upload_template', methods=['POST'])
 def admin_upload_template():
     password = request.form.get('password', '')
-    admin_pw = os.environ.get('ADMIN_PASSWORD', '')
-    if password != admin_pw:
+    # ✅ 修正：統一從 get_admin_password() 讀取
+    if password != get_admin_password():
         return jsonify({'error': '密碼錯誤'}), 401
     if 'template' not in request.files:
         return jsonify({'error': '請上傳範本檔案'}), 400
