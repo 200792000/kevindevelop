@@ -417,7 +417,10 @@ def send_email_with_attachments(subject, body, attachments, sender_name='盤點�
         return True
 
     except Exception as e:
-        print(f'發信失敗: {e}')
+        import traceback
+        print("❌ 發信失敗")
+        print(e)
+        traceback.print_exc()
         return False
 
 # ── API ───────────────────────────────────────────────────────
@@ -634,7 +637,7 @@ def api_generate_bu1():
             for fname, fpath in pdf_files:
                 zf.write(fpath, fname)
 
-        # ✅ 發信改為背景執行，不影響下載
+        # ✅ 改為同步發信（確保 Render 不會吃掉 thread）
         try:
             operator  = request.form.get('operator', '操作者未知')
             dept      = request.form.get('dept', '')
@@ -648,13 +651,19 @@ def api_generate_bu1():
                 f'補1通知書共 {len(補1通知)} 份，請見附件。\n\n'
                 f'此信由系統自動寄出，請勿直接回覆。'
             )
-            # 複製 pdf_files 路徑避免 thread 競爭
             email_files = list(pdf_files)
-            def send_async():
-                send_email_with_attachments(subject, body, email_files, sender_name=sender_display)
-            threading.Thread(target=send_async, daemon=True).start()
+            print("=== 開始發信 ===")
+            result = send_email_with_attachments(
+                subject,
+                body,
+                email_files,
+                sender_name=sender_display
+            )
+            print("發信結果:", result)
         except Exception as e:
-            print(f'寄信執行緒啟動失敗（不影響下載）: {e}')
+            import traceback
+            print("❌ 發信主流程錯誤")
+            traceback.print_exc()
 
         return send_file(zip_tmp.name, as_attachment=True,
             download_name=f'補1通知書_{version_full}_{mmdd_today}.zip',
