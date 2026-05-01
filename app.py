@@ -493,6 +493,8 @@ def api_generate_notice():
     try:
         m1, first_date1, _ = load_schedule(f1)
         m2, _, _           = load_schedule(f2)
+        print(f'[DEBUG] first_date1={first_date1}')
+        print(f'[DEBUG] notice_filename={get_notice_filename(first_date1)}')
         ver8   = extract_version(f1.filename)
         month  = str(int(first_date1.split('/')[1])).zfill(2)
         version_full = month + '-' + ver8
@@ -513,7 +515,7 @@ def api_generate_notice():
             with zipfile.ZipFile(zip_tmp.name, 'w') as zf:
                 for fname, fpath in files:
                     zf.write(fpath, fname)
-            base_name = get_notice_base_name()
+            base_name = get_notice_filename(first_date1) if first_date1 else get_notice_base_name()
             mmdd = get_today_mmdd()
             return send_file(zip_tmp.name, as_attachment=True,
                 download_name=f'{base_name}{mmdd}.zip',
