@@ -340,89 +340,64 @@ def make_bu1_pdf(store_name, chg_date, chg_noon, out_path):
 
     doc.save(out_path)
 
-# ── 發信功能 ─────────────────────────────────────────────────
+# ── 發信功能（改為 Resend API）───────────────────────────────
 def send_email_with_attachments(subject, body, attachments, sender_name='盤點系統'):
-    """
-    從 Google Sheets 系統設定讀取發信設定，寄送含附件的郵件。
-    支援任何 SMTP 伺服器（Gmail / 公司信箱皆可）。
-
-    系統設定需有以下 Key：
-      SMTP_HOST        - SMTP 伺服器，例如 mail.fme.com.tw
-      SMTP_PORT        - 連接埠，例如 587 或 465 或 25
-      SMTP_USER        - 寄件帳號，例如 kevin@fme.com.tw
-      SMTP_PASSWORD    - 信箱密碼
-      SMTP_USE_TLS     - 是否使用 STARTTLS：true / false（port 587 填 true，465 填 false）
-      MANAGER_EMAIL    - 經理信箱
-      SUPERVISOR_EMAIL - 課長信箱
-    """
+    import traceback
     try:
-        smtp_host     = get_setting('SMTP_HOST', 'mail.fme.com.tw')
-        smtp_port     = int(get_setting('SMTP_PORT', '587'))
-        smtp_user     = get_setting('SMTP_USER', '')
-        smtp_password = get_setting('SMTP_PASSWORD', '')
-        use_tls       = get_setting('SMTP_USE_TLS', 'true').strip().lower() == 'true'
+        print("=== 使用 Resend API 發信 ===")
+
+        api_key = os.environ.get("RESEND_API_KEY")
+        if not api_key:
+            print("❌ 沒有 RESEND_API_KEY")
+            return False
+
+        # 收件人（從 Sheets 讀）
         manager_email    = get_setting('MANAGER_EMAIL', '')
         supervisor_email = get_setting('SUPERVISOR_EMAIL', '')
-
-        if not smtp_user or not smtp_password:
-            print('發信設定不完整（SMTP_USER / SMTP_PASSWORD 未設定）')
-            return False
-
         recipients = [r.strip() for r in [manager_email, supervisor_email] if r.strip()]
+
         if not recipients:
-            print('收件人信箱未設定（MANAGER_EMAIL / SUPERVISOR_EMAIL）')
+            print("❌ 沒有收件人")
             return False
 
-        # 組裝郵件（寄件者顯示操作者姓名，實際帳號為系統信箱）
-        msg = MIMEMultipart()
-        msg['From']    = formataddr((sender_name, smtp_user))
-        msg['To']      = ', '.join(recipients)
-        msg['Subject'] = EmailHeader(subject, 'utf-8').encode()
-        msg.attach(MIMEText(body, 'plain', 'utf-8'))
-
-        # 附加檔案
+        # 附件處理
+        files = []
         for fname, fpath in attachments:
-            with open(fpath, 'rb') as f:
-                part = MIMEBase('application', 'octet-stream')
-                part.set_payload(f.read())
-            encoders.encode_base64(part)
-            # 中文檔名處理
-            part.add_header(
-                'Content-Disposition',
-                f'attachment',
-                filename=('utf-8', '', fname)
-            )
-            msg.attach(part)
+            with open(fpath, "rb") as f:
+                files.append(("attachments", (fname, f.read())))
 
-        # 依 port / TLS 選擇連線方式（timeout=15 避免 hang）
-        if smtp_port == 465:
-            with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=15) as server:
-                server.login(smtp_user, smtp_password)
-                server.sendmail(smtp_user, recipients, msg.as_string())
-        elif use_tls:
-            with smtplib.SMTP(smtp_host, smtp_port, timeout=15) as server:
-                server.ehlo()
-                server.starttls()
-                server.ehlo()
-                server.login(smtp_user, smtp_password)
-                server.sendmail(smtp_user, recipients, msg.as_string())
+        # 發信資料
+        data = {
+            "from": f"{sender_name} <onboarding@resend.dev>",
+            "to": recipients,
+            "subject": subject,
+            "text": body
+        }
+
+        # 呼叫 API
+        response = requests.post(
+            "https://api.resend.com/emails",
+            headers={
+                "Authorization": f"Bearer {api_key}"
+            },
+            files=files,
+            data=data
+        )
+
+        print("Resend 回應:", response.text)
+
+        if response.status_code == 200:
+            print("✅ 發信成功")
+            return True
         else:
-            with smtplib.SMTP(smtp_host, smtp_port, timeout=15) as server:
-                server.ehlo()
-                if smtp_password:
-                    server.login(smtp_user, smtp_password)
-                server.sendmail(smtp_user, recipients, msg.as_string())
-
-        print(f'信件已寄出至：{recipients}（{smtp_host}:{smtp_port}）')
-        return True
+            print("❌ 發信失敗")
+            return False
 
     except Exception as e:
-        import traceback
-        print("❌ 發信失敗")
-        print(e)
+        print("❌ API 發信錯誤")
         traceback.print_exc()
         return False
-
+        
 # ── API ───────────────────────────────────────────────────────
 @app.route('/health', methods=['GET'])
 def health():
