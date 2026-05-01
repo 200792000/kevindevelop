@@ -129,6 +129,22 @@ def get_notice_base_name():
     base = os.path.splitext(name)[0]
     return base
 
+def get_notice_filename(first_date_str):
+    """
+    依據班表第一筆日期產生異動通知書檔名前綴。
+    格式：(民國年+月份)盤點行程異動通知書-
+    例如：first_date_str = '2026/04/02' → '(11504)盤點行程異動通知書-'
+    民國年 = 西元年 - 1911，2026 → 115，2027 → 116
+    月份取自班表第一筆資料的月份
+    """
+    try:
+        parts = first_date_str.split('/')
+        year_roc = int(parts[0]) - 1911   # 2026 - 1911 = 115
+        month = int(parts[1])
+        return f'({year_roc}{month:02d})盤點行程異動通知書-'
+    except:
+        return get_notice_base_name()
+
 def get_today_mmdd():
     today = tw_now()
     return f"{today.month:02d}{today.day:02d}"
@@ -263,11 +279,12 @@ def generate_single_notice(diffs, version_full, notifier=''):
     return tmp.name
 
 # ── 產出異動通知書（超過10店自動分份）────────────────────────
-def generate_notice_files(diffs, version_full, notifier=''):
+def generate_notice_files(diffs, version_full, notifier='', first_date=''):
     chunks = [diffs[i:i+MAX_PER_SHEET] for i in range(0, len(diffs), MAX_PER_SHEET)]
     files = []
-    base_name = get_notice_base_name()
-    mmdd = get_today_mmdd()
+    # 用班表第一筆日期產生檔名前綴，例如 (11604)盤點行程異動通知書-
+    base_name = get_notice_filename(first_date) if first_date else get_notice_base_name()
+    mmdd = get_today_mmdd()  # 操作當天日期 MMDD
 
     for idx, chunk in enumerate(chunks):
         path = generate_single_notice(chunk, version_full, notifier)
@@ -484,7 +501,7 @@ def api_generate_notice():
         if not 異動通知:
             return jsonify({'error': '無異動通知書資料'}), 400
 
-        files = generate_notice_files(異動通知, version_full, notifier)
+        files = generate_notice_files(異動通知, version_full, notifier, first_date=first_date1)
 
         if len(files) == 1:
             return send_file(files[0][1], as_attachment=True,
