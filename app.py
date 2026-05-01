@@ -8,15 +8,7 @@ import pymupdf
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
-import pytz  # ← 新增（解決時區問題）
-import smtplib  # ← 新增（發信）
-import threading  # ← 新增（非同步發信）
-from email.mime.multipart import MIMEMultipart
-from email.mime.base import MIMEBase
-from email.mime.text import MIMEText
-from email import encoders
-from email.header import Header as EmailHeader
-from email.utils import formataddr
+import pytz
 
 app = Flask(__name__)
 CORS(app)
@@ -29,11 +21,10 @@ MAX_PER_SHEET = 10
 RENDER_SERVICE_ID = 'srv-d7mecdb7uimc73crjh6g'
 SCOPES = ['https://spreadsheets.google.com/feeds','https://www.googleapis.com/auth/drive']
 
-# ── 台灣時區（修正時區問題）────────────────────────────────────
+# ── 台灣時區 ────────────────────────────────────────────────
 TW_TZ = pytz.timezone('Asia/Taipei')
 
 def tw_now():
-    """取得台灣當前時間（UTC+8）"""
     return datetime.now(TW_TZ)
 
 
@@ -62,7 +53,6 @@ def log_to_sheet(ws, operator, dept, f1name, f2name, version_full, 異動通知,
     try:
         if not ws:
             return
-        # ✅ 修正：使用台灣時間
         now = tw_now().strftime('%Y/%m/%d %H:%M')
         total = len(異動通知) + len(補1通知)
         rows = []
@@ -126,7 +116,6 @@ def set_setting(key, value):
         return False
 
 def get_admin_password():
-    """✅ 統一密碼讀取：Sheets 優先，fallback 環境變數"""
     return get_setting('ADMIN_PASSWORD', os.environ.get('ADMIN_PASSWORD', ''))
 
 def get_template_name():
@@ -141,14 +130,12 @@ def get_notice_base_name():
     return base
 
 def get_today_mmdd():
-    # ✅ 修正：使用台灣時間
     today = tw_now()
     return f"{today.month:02d}{today.day:02d}"
 
 # ── 計算已發送截止日 ──────────────────────────────────────────
 def get_sent_deadline(today=None):
     if today is None:
-        # ✅ 修正：使用台灣時間（去掉 tzinfo 以便後續比較）
         today = tw_now().replace(tzinfo=None)
     days_since_monday = today.weekday()
     this_monday = today - timedelta(days=days_since_monday)
@@ -340,70 +327,12 @@ def make_bu1_pdf(store_name, chg_date, chg_noon, out_path):
 
     doc.save(out_path)
 
-# ── 發信功能（改為 Resend API）───────────────────────────────
-def send_email_with_attachments(subject, body, attachments, sender_name='盤點系統'):
-    import traceback
-    try:
-        print("=== 使用 Resend API 發信 ===")
-
-        api_key = os.environ.get("RESEND_API_KEY")
-        if not api_key:
-            print("❌ 沒有 RESEND_API_KEY")
-            return False
-
-        # 收件人（從 Sheets 讀）
-        manager_email    = get_setting('MANAGER_EMAIL', '')
-        supervisor_email = get_setting('SUPERVISOR_EMAIL', '')
-        recipients = [r.strip() for r in [manager_email, supervisor_email] if r.strip()]
-
-        if not recipients:
-            print("❌ 沒有收件人")
-            return False
-
-        # 附件處理
-        files = []
-        for fname, fpath in attachments:
-            with open(fpath, "rb") as f:
-                files.append(("attachments", (fname, f.read())))
-
-        # 發信資料
-        data = {
-            "from": f"{sender_name} <onboarding@resend.dev>",
-            "to": recipients,
-            "subject": subject,
-            "text": body
-        }
-
-        # 呼叫 API
-        response = requests.post(
-            "https://api.resend.com/emails",
-            headers={
-                "Authorization": f"Bearer {api_key}"
-            },
-            files=files,
-            data=data
-        )
-
-        print("Resend 回應:", response.text)
-
-        if response.status_code == 200:
-            print("✅ 發信成功")
-            return True
-        else:
-            print("❌ 發信失敗")
-            return False
-
-    except Exception as e:
-        print("❌ API 發信錯誤")
-        traceback.print_exc()
-        return False
-        
 # ── API ───────────────────────────────────────────────────────
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({
         'status': 'ok',
-        'server_time':      tw_now().strftime('%Y/%m/%d %H:%M'),  # ✅ 可用來確認時區
+        'server_time':      tw_now().strftime('%Y/%m/%d %H:%M'),
         'template_name':    get_template_name(),
         'shop_update_date': get_setting('SHOP_UPDATE_DATE', ''),
     })
@@ -412,7 +341,6 @@ def health():
 def admin_records():
     data = request.get_json()
     password  = data.get('password', '')
-    # ✅ 修正：統一從 get_admin_password() 讀取
     if password != get_admin_password():
         return jsonify({'error': '密碼錯誤'}), 401
     date_from = data.get('date_from', '')
@@ -451,7 +379,6 @@ def admin_search():
     data = request.get_json()
     password = data.get('password', '')
     keyword  = data.get('keyword', '').strip()
-    # ✅ 修正：統一從 get_admin_password() 讀取
     if password != get_admin_password():
         return jsonify({'error': '密碼錯誤'}), 401
     if not keyword:
@@ -612,34 +539,6 @@ def api_generate_bu1():
             for fname, fpath in pdf_files:
                 zf.write(fpath, fname)
 
-        # ✅ 改為同步發信（確保 Render 不會吃掉 thread）
-        try:
-            operator  = request.form.get('operator', '操作者未知')
-            dept      = request.form.get('dept', '')
-            now_str   = tw_now().strftime('%Y/%m/%d %H:%M')
-            sender_display = f'{operator}（{dept}）' if dept else operator
-            subject = f'【補1通知書】{version_full} 已產出'
-            body = (
-                f'您好，\n\n'
-                f'操作者：{sender_display}\n'
-                f'產出時間：{now_str}\n'
-                f'補1通知書共 {len(補1通知)} 份，請見附件。\n\n'
-                f'此信由系統自動寄出，請勿直接回覆。'
-            )
-            email_files = list(pdf_files)
-            print("=== 開始發信 ===")
-            result = send_email_with_attachments(
-                subject,
-                body,
-                email_files,
-                sender_name=sender_display
-            )
-            print("發信結果:", result)
-        except Exception as e:
-            import traceback
-            print("❌ 發信主流程錯誤")
-            traceback.print_exc()
-
         return send_file(zip_tmp.name, as_attachment=True,
             download_name=f'補1通知書_{version_full}_{mmdd_today}.zip',
             mimetype='application/zip')
@@ -650,7 +549,6 @@ def api_generate_bu1():
 def admin_verify():
     data = request.get_json()
     password = data.get('password', '')
-    # ✅ Sheets 優先，fallback 環境變數
     admin_pw = get_setting('ADMIN_PASSWORD', os.environ.get('ADMIN_PASSWORD', ''))
     if password == admin_pw:
         return jsonify({
@@ -666,7 +564,6 @@ def admin_change_password():
     data = request.get_json()
     old_pw  = data.get('old_password', '')
     new_pw  = data.get('new_password', '')
-    # ✅ 修正：舊密碼也從 Sheets 讀
     if old_pw != get_admin_password():
         return jsonify({'error': '舊密碼錯誤'}), 401
     if not new_pw or len(new_pw) < 6:
@@ -681,7 +578,6 @@ def admin_change_password():
 @app.route('/admin/upload_template', methods=['POST'])
 def admin_upload_template():
     password = request.form.get('password', '')
-    # ✅ 修正：統一從 get_admin_password() 讀取
     if password != get_admin_password():
         return jsonify({'error': '密碼錯誤'}), 401
     if 'template' not in request.files:
