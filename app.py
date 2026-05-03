@@ -570,7 +570,7 @@ def api_generate_notice():
         m2, _, _           = load_schedule(f2)
         print(f'[DEBUG] first_date1={first_date1}')
         print(f'[DEBUG] notice_filename={get_notice_filename(first_date1)}')
-        ver8   = extract_version(f1.filename)
+        ver8   = extract_version(f2.filename)  # ✅ 修正：用版本二日期
         month  = str(int(first_date1.split('/')[1])).zfill(2)
         version_full = month + '-' + ver8
         deadline = get_sent_deadline()
@@ -607,7 +607,7 @@ def api_generate_bu1():
     try:
         m1, first_date1, _ = load_schedule(f1)
         m2, _, _           = load_schedule(f2)
-        ver8   = extract_version(f1.filename)
+        ver8   = extract_version(f2.filename)  # ✅ 修正：用版本二日期
         month  = str(int(first_date1.split('/')[1])).zfill(2)
         version_full = month + '-' + ver8
         deadline = get_sent_deadline()
