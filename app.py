@@ -53,11 +53,8 @@ def download_template_from_drive():
         if not service:
             print('Drive 服務不可用，跳過範本下載')
             return False
-        # 以 xlsx 格式匯出（因為 Drive 上是 Google Sheets 格式）
-        request_ = service.files().export_media(
-            fileId=DRIVE_TEMPLATE_FILE_ID,
-            mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-        )
+        # 直接下載原始 xlsx 檔案（非 Google Sheets 格式用 get_media）
+        request_ = service.files().get_media(fileId=DRIVE_TEMPLATE_FILE_ID)
         buf = io.BytesIO()
         downloader = MediaIoBaseDownload(buf, request_)
         done = False
