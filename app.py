@@ -3,11 +3,13 @@ from flask_cors import CORS
 import openpyxl
 from openpyxl import load_workbook
 from datetime import datetime, timedelta
-import shutil, re, os, tempfile, zipfile
+import shutil, re, os, tempfile, zipfile, json, io
 import pymupdf
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 import pytz
 
 app = Flask(__name__)
@@ -21,11 +23,86 @@ MAX_PER_SHEET = 10
 RENDER_SERVICE_ID = 'srv-d7mecdb7uimc73crjh6g'
 SCOPES = ['https://spreadsheets.google.com/feeds','https://www.googleapis.com/auth/drive']
 
+# Google Drive 範本 File ID（從 Drive 連結取得）
+DRIVE_TEMPLATE_FILE_ID = '1uPD8cgYuOoD95WZBgoyXjSg-54G1YBNO'
+
 # ── 台灣時區 ────────────────────────────────────────────────
 TW_TZ = pytz.timezone('Asia/Taipei')
 
 def tw_now():
     return datetime.now(TW_TZ)
+
+# ── Google Drive 工具函式 ────────────────────────────────────
+def get_drive_service():
+    """取得 Google Drive API 服務"""
+    try:
+        creds_json = os.environ.get('GOOGLE_SERVICE_ACCOUNT', '')
+        if not creds_json:
+            return None
+        creds_dict = json.loads(creds_json)
+        creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+        return build('drive', 'v3', credentials=creds)
+    except Exception as e:
+        print(f'Drive 服務初始化失敗: {e}')
+        return None
+
+def download_template_from_drive():
+    """從 Google Drive 下載最新範本到本地"""
+    try:
+        service = get_drive_service()
+        if not service:
+            print('Drive 服務不可用，跳過範本下載')
+            return False
+        # 以 xlsx 格式匯出（因為 Drive 上是 Google Sheets 格式）
+        request_ = service.files().export_media(
+            fileId=DRIVE_TEMPLATE_FILE_ID,
+            mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        )
+        buf = io.BytesIO()
+        downloader = MediaIoBaseDownload(buf, request_)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        buf.seek(0)
+        with open(TEMPLATE_PATH, 'wb') as f:
+            f.write(buf.read())
+        print(f'✅ 範本已從 Drive 下載更新：{TEMPLATE_PATH}')
+        return True
+    except Exception as e:
+        print(f'從 Drive 下載範本失敗: {e}')
+        return False
+
+def upload_template_to_drive():
+    """把本地範本上傳（更新）到 Google Drive"""
+    try:
+        service = get_drive_service()
+        if not service:
+            return False
+        with open(TEMPLATE_PATH, 'rb') as f:
+            media = MediaIoBaseUpload(
+                io.BytesIO(f.read()),
+                mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                resumable=False
+            )
+        service.files().update(
+            fileId=DRIVE_TEMPLATE_FILE_ID,
+            media_body=media
+        ).execute()
+        print('✅ 範本已上傳到 Drive')
+        return True
+    except Exception as e:
+        print(f'上傳範本到 Drive 失敗: {e}')
+        return False
+
+# ── 啟動時從 Drive 下載最新範本 ──────────────────────────────
+def init_template():
+    """應用程式啟動時，從 Drive 下載最新範本"""
+    print('=== 啟動：從 Drive 同步範本 ===')
+    download_template_from_drive()
+
+# 在 Flask app 啟動時執行
+with app.app_context():
+    init_template()
 
 
 def get_sheet():
@@ -607,6 +684,7 @@ def admin_upload_template():
         return jsonify({'error': '請上傳 .xlsx 格式'}), 400
     f.save(TEMPLATE_PATH)
     save_template_name(f.filename)
+    upload_template_to_drive()  # ✅ 同步到 Drive
     return jsonify({
         'ok': True,
         'message': f'範本已更新！({f.filename})',
@@ -652,6 +730,9 @@ def admin_upload_shop():
 
         tmpl_wb.save(TEMPLATE_PATH)
 
+        # ✅ 同步到 Drive
+        upload_template_to_drive()
+
         # 更新 Sheets 紀錄日期
         today_str = tw_now().strftime('%Y/%m/%d')
         set_setting('SHOP_UPDATE_DATE', today_str)
@@ -696,6 +777,9 @@ def admin_upload_staff():
                 tmpl_ws.cell(row=i+1, column=j+1, value=val)
 
         tmpl_wb.save(TEMPLATE_PATH)
+
+        # ✅ 同步到 Drive
+        upload_template_to_drive()
 
         today_str = tw_now().strftime('%Y/%m/%d')
         set_setting('STAFF_UPDATE_DATE', today_str)
